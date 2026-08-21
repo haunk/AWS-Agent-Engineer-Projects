@@ -1,0 +1,37 @@
+{
+  "flowInputNode": {
+    "nodeName": "FlowInputNode"
+  },
+  "tests": [
+    {
+      "id": "t1_bug_report",
+      "prompt": "The checkout page crashes whenever I click the Pay button. To reproduce it, add an item to the cart, open checkout, and click Pay. This happened in Chrome 120 on Windows 11.",
+      "expected": "The chatbot should recognize this as a bug report, collect the bug description, reproduction steps, and environment, and create or attempt to create a support ticket."
+    },
+    {
+      "id": "t2_bug_report_missing_details",
+      "prompt": "The website is not working properly when I try to place an order.",
+      "expected": "The chatbot should recognize this as a possible bug report and ask the customer for additional details, such as what happened, how to reproduce it, and the browser or device used."
+    },
+    {
+      "id": "t3_platform_question",
+      "prompt": "How long does delivery usually take?",
+      "expected": "The chatbot should answer using the FAQ. It should explain that estimated delivery times appear at checkout and in the shipping confirmation email, with processing typically taking one to two business days."
+    },
+    {
+      "id": "t4_platform_question",
+      "prompt": "Can I return an item after receiving it?",
+      "expected": "The chatbot should answer from the FAQ that most unused items in their original packaging can be returned within 30 days of delivery, subject to exclusions."
+    },
+    {
+      "id": "t5_other_request",
+      "prompt": "Can you recommend a good movie to watch tonight?",
+      "expected": "The chatbot should recognize that this is outside the online shop FAQ and politely redirect the customer to human support."
+    },
+    {
+      "id": "t6_uncovered_question",
+      "prompt": "Do you offer installation services for furniture?",
+      "expected": "The chatbot should explain that the FAQ does not cover this question and direct the customer to human support through the help or contact form."
+    }
+  ]
+}
