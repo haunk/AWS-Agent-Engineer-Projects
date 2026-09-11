@@ -120,13 +120,14 @@ class DiscountBreakdown(BaseModel):
     """Validated loyalty discount calculation result."""
     original_total: float = Field(ge=0, description="Original order total in USD")
     tier: str = Field(description="Customer loyalty tier")
-    tier_discount_rate: str = Field(description="Tier discount percentage, e.g. '10%'")
+    tier_discount_pct: str = Field(description="Tier discount percentage, e.g. '10%'")
     tier_discount: float = Field(ge=0, description="Dollar amount saved from tier")
     points_redeemed: int = Field(ge=0, description="Loyalty points used")
     points_discount: float = Field(ge=0, description="Dollar amount saved from points")
     total_discount: float = Field(ge=0, description="Combined savings")
     final_total: float = Field(ge=0, description="Amount the customer pays")
     remaining_points: int = Field(ge=0, description="Points left after redemption")
+    points_earned: int = Field(ge=0, description="Points earned from this order")
 
 
 class KBSearchResult(BaseModel):
@@ -372,10 +373,18 @@ def search_knowledge_base(query: str) -> str:
     Returns:
         Relevant information retrieved from the knowledge base
     """
-    resp = _bedrock_runtime.retrieve(
-        knowledgeBaseId=KB_ID,
-        retrievalQuery={"text": query},
-    )
+    if not KB_ID:
+        return "Knowledge base not configured. Please set the KB_ID variable with your Amazon Bedrock Knowledge Base ID."
+    
+    try:
+        resp = _bedrock_runtime.retrieve(
+            knowledgeBaseId=KB_ID,
+            retrievalQuery={"text": query},
+        )
+    except Exception as e:
+        logger.error("Knowledge base retrieve failed: %s", e)
+        return f"Knowledge base search failed: {e}"
+        
     results = resp.get("retrievalResults", [])
     if not results:
         return f"No information found for: {query}"
@@ -435,43 +444,48 @@ def calculate_loyalty_discount(
     """
     # TODO: Build the code string (use an f-string to inject the arguments)
     code = f"""
-    import json
+    import json, math
 
     loyalty_points = {loyalty_points}
     tier = "{tier}"
     order_total = {order_total}
     product_category = "{product_category}"
 
-    # Tier discount rates
-    tier_discounts = {{"Bronze": 0.02, "Silver": 0.05, "Gold": 0.10, "Platinum": 0.15}}
+    # 1. Earn rates (points per dollar) — category affects ONLY new points
+    earn_rates = {{"standard": 1, "device": 2, "fresh": 5}}
+    earn_rate = earn_rates.get(product_category, 1)
+
+    # 2. Tier discount rates
+    tier_discounts = {{"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}}
     tier_discount_rate = tier_discounts.get(tier, 0.0)
 
-    # Category multipliers
-    category_multipliers = {{"standard": 1.0, "electronics": 0.5, "premium": 0.75}}
-    multiplier = category_multipliers.get(product_category, 1.0)
+    # 3. Points redemption: floor to nearest 500, 100 pts = $1, cap at 50% of order
+    redeemable_points = (loyalty_points // 500) * 500
+    max_points_value = order_total * 0.50
+    points_discount = min(redeemable_points / 100, max_points_value)
+    points_redeemed = int(points_discount * 100)
 
-    # Points redemption: 100 points = $1
-    points_to_redeem = min(loyalty_points, int(order_total * 100 * multiplier))
-    points_discount = points_to_redeem / 100
+    # 4. Tier discount applied AFTER points redemption
+    subtotal_after_points = order_total - points_discount
+    tier_discount = round(subtotal_after_points * tier_discount_rate, 2)
 
-    # Tier discount
-    tier_discount = round(order_total * tier_discount_rate, 2)
-
-    # Final total
+    # 5. Final totals
     total_discount = round(points_discount + tier_discount, 2)
     final_total = round(max(order_total - total_discount, 0), 2)
-    remaining_points = loyalty_points - points_to_redeem
+    remaining_points = loyalty_points - points_redeemed
+    points_earned = int(final_total * earn_rate)
 
     result = {{
         "original_total": order_total,
         "tier": tier,
-        "tier_discount_rate": f"{{int(tier_discount_rate * 100)}}%",
+        "tier_discount_pct": f"{{int(tier_discount_rate * 100)}}%",
         "tier_discount": tier_discount,
-        "points_redeemed": points_to_redeem,
+        "points_redeemed": points_redeemed,
         "points_discount": points_discount,
         "total_discount": total_discount,
         "final_total": final_total,
         "remaining_points": remaining_points,
+        "points_earned": points_earned,
     }}
     print(json.dumps(result))
     """
@@ -500,17 +514,24 @@ def calculate_loyalty_discount(
     except Exception as exc:
         # TODO: Implement fallback calculation using tier discount only
         logger.error("Code Interpreter failed: %s", exc)
-        # Fallback: do the calculation locally
-        tier_discounts = {"Bronze": 0.02, "Silver": 0.05, "Gold": 0.10, "Platinum": 0.15}
+        tier_discounts = {"Silver": 0.00, "Gold": 0.10, "Platinum": 0.15}
         tier_rate = tier_discounts.get(tier, 0.0)
         tier_discount = round(order_total * tier_rate, 2)
         final_total = round(order_total - tier_discount, 2)
+        earn_rates = {"standard": 1, "device": 2, "fresh": 5}
+        points_earned = int(final_total * earn_rates.get(product_category, 1))
         return json.dumps({
             "original_total": order_total,
             "tier": tier,
+            "tier_discount_pct": f"{int(tier_rate * 100)}%",
             "tier_discount": tier_discount,
+            "points_redeemed": 0,
+            "points_discount": 0.0,
+            "total_discount": tier_discount,
             "final_total": final_total,
-            "note": "Simplified calculation — Code Interpreter unavailable",
+            "remaining_points": loyalty_points,
+            "points_earned": points_earned,
+            "note": "Simplified calculation - Code Interpreter unavailable",
         })
 
 
