@@ -1,3 +1,15 @@
+cat > .gitignore << 'EOF'
+# Ignore everything by default
 *
-!Project_starter/
+
+# Allow these
 !.gitignore
+!*.pdf
+!Project_starter/
+!Project_starter/**
+
+# Never commit secrets or junk
+Project_starter/.env
+Project_starter/venv/
+Project_starter/**/__pycache__/
+EOF
