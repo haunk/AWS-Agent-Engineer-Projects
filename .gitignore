@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Ignore everything by default
 *
 
@@ -12,4 +11,3 @@ cat > .gitignore << 'EOF'
 Project_starter/.env
 Project_starter/venv/
 Project_starter/**/__pycache__/
-EOF
