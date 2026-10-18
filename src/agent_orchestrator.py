@@ -207,6 +207,44 @@ def _update_workflow_state(session_id: str, updates: dict,
     raise RuntimeError("WorkflowState update: unexpected exit from retry loop")
 
 
+# ─────────────────────────────────────────────────────
+# SMALL HELPERS (added for the tool implementations)
+# ─────────────────────────────────────────────────────
+
+def _to_plain(value):
+    """
+    Convert DynamoDB values (Decimal, nested dicts/lists) into plain
+    JSON-friendly Python types so tool results serialize cleanly.
+    """
+    from decimal import Decimal
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, dict):
+        return {k: _to_plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_plain(v) for v in value]
+    return value
+
+
+def _reset_history(agent: Agent) -> None:
+    """
+    Clear a worker agent's conversation history before reusing it.
+    Workers share context through WorkflowState (DynamoDB), not chat history,
+    so a clean start keeps each call focused and avoids re-sending old
+    messages to Bedrock (which would cost extra input tokens).
+    """
+    agent.messages = []
+
+
+def _days_since(date_str: Optional[str]) -> Optional[int]:
+    """Return how many days ago a YYYY-MM-DD date was, or None if unparseable."""
+    from datetime import datetime
+    try:
+        return (datetime.now() - datetime.strptime(date_str, '%Y-%m-%d')).days
+    except (TypeError, ValueError):
+        return None
+
+
 # ═══════════════════════════════════════════════════════
 #  TASK 2 - MULTI-AGENT ORCHESTRATION
 # ═══════════════════════════════════════════════════════
@@ -225,10 +263,34 @@ def build_inventory_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel using the WORKER model
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+        region_name=config.AWS_REGION,
+    )
 
     # TODO: System prompt for the Inventory Agent
-    pass
+    system_prompt = """You are the NovaMart InventoryAgent, a data gatherer.
+
+Your ONLY job is to look up facts in the order and customer databases and
+report them accurately. You NEVER make decisions.
+
+How to work:
+1. Read the request and identify the customer_id and any order_id mentioned.
+2. Use your tools to gather the facts:
+   - check_order_status  -> one specific order (needs customer_id AND order_id)
+   - get_customer_tier   -> the customer's tier (Standard or Premium)
+   - list_customer_orders -> all orders for the customer
+   For any order or return request, ALWAYS call get_customer_tier as well,
+   because downstream agents need the tier.
+3. Report the facts in a short, structured summary: customer tier, order_id,
+   product_name, category, status, order_date, price, quantity and how many
+   days ago the order was placed (if available).
+
+Rules:
+- Do NOT decide whether a return or refund is allowed. The RefundAgent does that.
+- Do NOT quote or interpret policy. The PolicyAgent does that.
+- If a record is not found, say so clearly. Never invent data."""
 
     # TODO: Implement check_order_status
     # NOTE: the Orders table has a COMPOSITE key (customer_id = partition key,
@@ -248,7 +310,16 @@ def build_inventory_agent() -> Agent:
             Order record (order_id, status, product_name, order_date, price, ...)
             or a not-found message
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        response = table.get_item(Key={'customer_id': customer_id, 'order_id': order_id})
+        item = response.get('Item')
+        if not item:
+            return {'found': False,
+                    'message': f"Order {order_id} not found for customer {customer_id}"}
+        order = _to_plain(item)
+        order['days_since_order'] = _days_since(order.get('order_date'))
+        order['found'] = True
+        return order
 
     # TODO: Implement get_customer_tier
     @tool
@@ -263,7 +334,14 @@ def build_inventory_agent() -> Agent:
         Returns:
             Customer profile including tier and account details
         """
-        pass
+        table = dynamodb.Table(config.CUSTOMERS_TABLE)
+        response = table.get_item(Key={'customer_id': customer_id})
+        item = response.get('Item')
+        if not item:
+            return {'found': False, 'message': f"Customer {customer_id} not found"}
+        customer = _to_plain(item)
+        customer['found'] = True
+        return customer
 
     # TODO: Implement list_customer_orders
     @tool
@@ -277,10 +355,20 @@ def build_inventory_agent() -> Agent:
         Returns:
             List of all orders with order_id, status, order_date, and amount
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        response = table.query(KeyConditionExpression=Key('customer_id').eq(customer_id))
+        orders = [_to_plain(item) for item in response.get('Items', [])]
+        for order in orders:
+            order['days_since_order'] = _days_since(order.get('order_date'))
+        return {'customer_id': customer_id, 'order_count': len(orders), 'orders': orders}
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        name="InventoryAgent",
+        model=model,
+        system_prompt=system_prompt,
+        tools=[check_order_status, get_customer_tier, list_customer_orders],
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -296,10 +384,36 @@ def build_refund_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.1,
+        region_name=config.AWS_REGION,
+    )
 
     # TODO: System prompt for the Refund Agent
-    pass
+    system_prompt = """You are the NovaMart RefundAgent. You decide whether a
+return/refund request is eligible and, if it is, you initiate it.
+
+Decision process (follow in order, every time):
+1. ALWAYS call get_inventory_context(session_id) FIRST to read the facts the
+   InventoryAgent gathered (customer tier, order status, order date, product).
+   Never decide without these facts.
+2. Apply the return window for the customer's tier:
+   - Standard tier: 30 days from the order date
+   - Premium tier:  60 days from the order date
+3. The order must have status 'delivered' to be returned. Orders that are
+   'processing' or 'shipped' are not yet eligible (suggest cancellation or
+   waiting for delivery). 'cancelled' orders cannot be returned.
+4. If the order is within the window and delivered -> call initiate_refund
+   with the customer_id, order_id and the customer's reason.
+   If it is NOT eligible -> do NOT call initiate_refund. Explain why.
+
+Output a short decision summary:
+- Decision: APPROVED or DENIED
+- Tier and window applied (e.g. Premium, 60 days)
+- Days since order
+- Return reference number (if approved) and next steps
+Be precise and factual. Do not write the final customer message."""
 
     # TODO: Implement get_inventory_context
     @tool
@@ -313,7 +427,15 @@ def build_refund_agent() -> Agent:
         Returns:
             The inventory_agent field from WorkflowState, or empty dict if not yet set
         """
-        pass
+        state = _read_workflow_state(session_id) or {}
+        inventory_facts = state.get('inventory_agent')
+        if not inventory_facts:
+            return {}
+        return {
+            'session_id':      session_id,
+            'customer_id':     state.get('customer_id', ''),
+            'inventory_agent': inventory_facts,
+        }
 
     # TODO: Implement initiate_refund
     @tool
@@ -329,10 +451,44 @@ def build_refund_agent() -> Agent:
         Returns:
             Confirmation dict with return_reference number and instructions
         """
-        pass
+        table = dynamodb.Table(config.ORDERS_TABLE)
+        return_reference = f"RET-{uuid.uuid4().hex[:8].upper()}"
+        try:
+            table.update_item(
+                Key={'customer_id': customer_id, 'order_id': order_id},
+                UpdateExpression=('SET #s = :status, return_reference = :ref, '
+                                  'return_reason = :reason, return_requested_at = :ts'),
+                ConditionExpression='attribute_exists(order_id)',
+                ExpressionAttributeNames={'#s': 'status'},   # 'status' is a reserved word
+                ExpressionAttributeValues={
+                    ':status': 'return_initiated',
+                    ':ref':    return_reference,
+                    ':reason': reason,
+                    ':ts':     time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                },
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                return {'success': False,
+                        'message': f"Order {order_id} not found for customer {customer_id}"}
+            raise
+        return {
+            'success':          True,
+            'order_id':         order_id,
+            'return_reference': return_reference,
+            'status':           'return_initiated',
+            'instructions': ("A prepaid return shipping label will be emailed to the customer. "
+                             "Pack the item securely and drop it off within 14 days. "
+                             "Refunds are processed within 5-7 business days of receiving the return."),
+        }
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        name="RefundAgent",
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_inventory_context, initiate_refund],
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -348,32 +504,62 @@ def build_policy_agent() -> Agent:
     the combined results into a complete, grounded policy answer.
     """
 
+    # Shared instructions for the three retriever sub-agents
+    def _retriever_prompt(domain: str, tool_name: str) -> str:
+        return (f"You are the NovaMart {domain}PolicyRetrieverAgent. "
+                f"For every query, call {tool_name} exactly once with the query. "
+                f"Then return the relevant passages faithfully, quoting the key rules "
+                f"(numbers, time windows, tier differences) exactly as written. "
+                f"Do not add information that is not in the passages. "
+                f"If nothing relevant is found, say 'No relevant {domain.lower()} policy found.'")
+
     # TODO: Build ReturnsPolicyRetrieverAgent
     @tool
     def retrieve_returns_policy(query: str) -> str:
         """Retrieve relevant passages from the Returns Policy knowledge base."""
-        pass
+        results = retrieve_from_knowledge_base(config.RETURNS_KB_ID, query)
+        return format_kb_results(results)
 
     # Create the ReturnsPolicyRetrieverAgent with the tool above
-    pass
+    returns_retriever = Agent(
+        name="ReturnsPolicyRetrieverAgent",
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0,
+                           region_name=config.AWS_REGION),
+        system_prompt=_retriever_prompt('Returns', 'retrieve_returns_policy'),
+        tools=[retrieve_returns_policy],
+    )
 
     # TODO: Build ShippingPolicyRetrieverAgent
     @tool
     def retrieve_shipping_policy(query: str) -> str:
         """Retrieve relevant passages from the Shipping Policy knowledge base."""
-        pass
+        results = retrieve_from_knowledge_base(config.SHIPPING_KB_ID, query)
+        return format_kb_results(results)
 
     # Create the ShippingPolicyRetrieverAgent with the tool above
-    pass
+    shipping_retriever = Agent(
+        name="ShippingPolicyRetrieverAgent",
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0,
+                           region_name=config.AWS_REGION),
+        system_prompt=_retriever_prompt('Shipping', 'retrieve_shipping_policy'),
+        tools=[retrieve_shipping_policy],
+    )
 
     # TODO: Build WarrantyPolicyRetrieverAgent
     @tool
     def retrieve_warranty_policy(query: str) -> str:
         """Retrieve relevant passages from the Warranty Policy knowledge base."""
-        pass
+        results = retrieve_from_knowledge_base(config.WARRANTY_KB_ID, query)
+        return format_kb_results(results)
 
     # Create the WarrantyPolicyRetrieverAgent with the tool above
-    pass
+    warranty_retriever = Agent(
+        name="WarrantyPolicyRetrieverAgent",
+        model=BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0,
+                           region_name=config.AWS_REGION),
+        system_prompt=_retriever_prompt('Warranty', 'retrieve_warranty_policy'),
+        tools=[retrieve_warranty_policy],
+    )
 
     # TODO: Implement search_all_policies - parallel RAG retrieval tool
     @tool
@@ -392,6 +578,11 @@ def build_policy_agent() -> Agent:
         """
         # Build a dict mapping domain names to their retriever agents
         # e.g. {'Returns': returns_retriever, 'Shipping': shipping_retriever, ...}
+        retrievers = {
+            'Returns':  returns_retriever,
+            'Shipping': shipping_retriever,
+            'Warranty': warranty_retriever,
+        }
 
         # ── Trace: show parallel KB dispatch to learners ──────────────────
         trace.kb_start({
@@ -414,27 +605,72 @@ def build_policy_agent() -> Agent:
             Results are returned as values and printed cleanly and
             sequentially by trace.kb_result() after all futures join.
             """
-            pass
+            try:
+                _reset_history(agent)          # each retrieval starts clean
+                result = agent(query)
+                return domain, _strip_xml_tags(str(result)).strip()
+            except Exception as e:
+                return domain, f"[{domain} retrieval failed: {e}]"
 
         # Use ThreadPoolExecutor to run all three retrievers in parallel
         # Collect results into a dict: {'Returns': '...', 'Shipping': '...', ...}
-
-        # ── Trace: all KBs responded - print each result sequentially ─────
-        # trace.kb_done(len(retrievers))
-        # for domain in ['Returns', 'Shipping', 'Warranty']:
-        #     trace.kb_result(domain, results.get(domain, '[No results]'))
+        results = {}
+        try:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(_run_retriever, domain, agent, query): domain
+                    for domain, agent in retrievers.items()
+                }
+                for future in as_completed(futures):
+                    domain = futures[future]
+                    try:
+                        _, text = future.result()
+                        results[domain] = text
+                    except Exception as e:
+                        results[domain] = f"[{domain} retrieval failed: {e}]"
+        finally:
+            # ── Trace: all KBs responded - print each result sequentially ─────
+            trace.kb_done(len(retrievers))
+        for domain in ['Returns', 'Shipping', 'Warranty']:
+            trace.kb_result(domain, results.get(domain, '[No results]'))
 
         # Combine results from all three domains and return
-        pass
+        combined = [f"=== {domain.upper()} POLICY ===\n{results.get(domain, '[No results]')}"
+                    for domain in ['Returns', 'Shipping', 'Warranty']]
+        return "\n\n".join(combined)
 
     # TODO: Create a BedrockModel for the PolicyAgent coordinator
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.2,
+        region_name=config.AWS_REGION,
+    )
 
     # TODO: System prompt for PolicyAgent coordinator
-    pass
+    system_prompt = """You are the NovaMart PolicyAgent, the coordinator of a
+multi-agent RAG system covering Returns, Shipping and Warranty policies.
+
+How to work:
+1. ALWAYS call search_all_policies FIRST with the customer's policy question.
+   It queries all three policy knowledge bases in parallel.
+2. Read the passages from all three domains and synthesize ONE clear,
+   grounded answer to the question.
+
+Rules:
+- Use ONLY information found in the retrieved passages. Never invent policy.
+- Quote exact numbers (days, fees, warranty lengths) and tier differences
+  (Standard vs Premium) precisely.
+- If the passages do not answer the question, say so clearly.
+- Mention which policy area each fact comes from (Returns, Shipping, Warranty).
+- You explain policy text only. You have no access to customer or order data."""
 
     # TODO: Instantiate and return the PolicyAgent coordinator
-    pass
+    return Agent(
+        name="PolicyAgent",
+        model=model,
+        system_prompt=system_prompt,
+        tools=[search_all_policies],
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -450,10 +686,37 @@ def build_communication_agent() -> Agent:
     """
 
     # TODO: Create a BedrockModel
-    pass
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        temperature=0.3,
+        region_name=config.AWS_REGION,
+    )
 
     # TODO: System prompt for the Communication Agent
-    pass
+    system_prompt = """You are the NovaMart CommunicationAgent. You write the
+FINAL message the customer will read.
+
+How to work:
+1. ALWAYS call get_full_workflow_context(session_id) first to read everything
+   the other agents found (inventory facts, policy answer, refund decision).
+2. Write one clear, warm and professional reply that answers the customer's
+   original request.
+
+Content rules:
+- Include ALL relevant findings: order details, the refund decision and the
+  reason, the return reference number and next steps, and any policy facts.
+- Use only facts from the workflow context. Never invent order data, policy
+  rules or reference numbers.
+- If a request was denied, explain why with empathy and offer an alternative
+  where possible (e.g. warranty support or contacting support).
+- For a math/calculation question with no other agent findings, compute the
+  answer yourself step by step, round currency to 2 decimals only at the end,
+  and show the short working.
+
+Style:
+- Address the customer politely, keep it concise (short paragraphs or bullets).
+- No internal jargon (do not mention agents, tools, sessions or DynamoDB).
+- Sign off as "NovaMart Customer Support"."""
 
     # TODO: Implement get_full_workflow_context
     @tool
@@ -467,10 +730,19 @@ def build_communication_agent() -> Agent:
         Returns:
             Full WorkflowState dict (inventory_agent, policy_agent, refund_agent)
         """
-        pass
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {'session_id': session_id,
+                    'message': 'No workflow state found for this session.'}
+        return _to_plain(state)
 
     # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        name="CommunicationAgent",
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_full_workflow_context],
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -488,12 +760,46 @@ def build_orchestrator_agent(
     """
 
     # TODO: Create a BedrockModel using the ORCHESTRATOR model
-    pass
+    model = BedrockModel(
+        model_id=config.ORCHESTRATOR_MODEL_ID,
+        temperature=0.0,
+        region_name=config.AWS_REGION,
+    )
 
     # TODO: System prompt for the Orchestrator
     # For arithmetic, skip Inventory, Policy and Refund, but still call
     # CommunicationAgent last. Round currency only after the full calculation.
-    pass
+    system_prompt = """You are the NovaMart OrchestratorAgent. You ROUTE customer
+requests to specialist agents. You never answer the customer yourself.
+
+Every message starts with "[Session ID: <id>] [Customer ID: <id>]". Extract
+both values and pass them unchanged to every tool that asks for them.
+
+ROUTING RULES (follow exactly):
+1. EVERY request, ALWAYS first: call initialize_session(session_id, customer_id).
+2. Order status / return / refund requests: call route_to_inventory_agent
+   FIRST to gather facts, THEN call route_to_refund_agent for the decision.
+   (For a pure order-status question with no return/refund, the refund agent
+   is not needed.)
+3. Policy meaning questions (return windows, shipping rates or times,
+   warranty terms): call route_to_policy_agent.
+4. Account questions ("what is my tier?", "am I premium?", "show my orders"):
+   call route_to_inventory_agent. NEVER use the policy agent for these - it
+   only knows policy text, not customer data.
+5. Math / calculation questions (prices, discounts, totals): go straight to
+   route_to_communication_agent. Skip Inventory, Policy and Refund.
+   Do not calculate yourself. Rounding of currency happens only after the
+   full calculation, which the CommunicationAgent performs.
+6. EVERY request, ALWAYS last: call route_to_communication_agent to compose
+   the final reply.
+
+CRITICAL:
+- You must NEVER write the customer-facing response yourself.
+  route_to_communication_agent must be your very last tool call, no exceptions.
+- A request can match several rules (e.g. a return plus a policy question):
+  run every matching route before the communication agent.
+- After route_to_communication_agent returns, reply with its text exactly as
+  returned. Do not add, remove or rephrase anything."""
 
     # Each routing tool follows the same pattern:
     #   1. read the current WorkflowState  (_read_workflow_state)
@@ -502,6 +808,38 @@ def build_orchestrator_agent(
     #      (_update_workflow_state(session_id, {'<column>': text}, expected_version))
     # The terminal trace UI can show each step: call trace.step_start('inventory_agent')
     # before the worker runs and trace.step_done('inventory_agent', old_version) after.
+
+    def _run_worker(column: str, label: str, agent: Agent, session_id: str,
+                    customer_id: str, prompt: str) -> str:
+        """
+        Shared routing pattern used by every route_to_* tool:
+          1. read the current WorkflowState (and its version)
+          2. invoke the worker agent
+          3. write the worker's result to its column with optimistic locking
+        """
+        # 1. Read current state (create it defensively if initialize_session was skipped)
+        state = _read_workflow_state(session_id)
+        if state is None:
+            try:
+                state = _create_workflow_state(session_id, customer_id or 'UNKNOWN')
+            except ClientError as e:
+                # Another tool (e.g. initialize_session) created it at the same moment
+                if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                    raise
+                state = _read_workflow_state(session_id) or {}
+        old_version = int(state.get('version', 0))
+
+        # 2. Invoke the worker on a clean history
+        trace.step_start(column)
+        trace.agent_section(label)
+        _reset_history(agent)
+        result = agent(prompt)
+        text = _strip_xml_tags(str(result)).strip()
+
+        # 3. Write the result back (retries automatically on version conflicts)
+        _update_workflow_state(session_id, {column: text}, old_version)
+        trace.step_done(column, old_version)
+        return text
 
     # TODO: Implement route_to_inventory_agent
     @tool
@@ -518,7 +856,12 @@ def build_orchestrator_agent(
         Returns:
             Inventory facts retrieved by the InventoryAgent
         """
-        pass
+        prompt = (f"Session ID: {session_id}\n"
+                  f"Customer ID: {customer_id}\n"
+                  f"Customer request: {request}\n\n"
+                  f"Gather all relevant order and customer facts for this request.")
+        return _run_worker('inventory_agent', 'InventoryAgent', inventory_agent,
+                           session_id, customer_id, prompt)
 
     # TODO: Implement route_to_policy_agent
     @tool
@@ -534,7 +877,9 @@ def build_orchestrator_agent(
         Returns:
             Policy information retrieved and synthesized by PolicyAgent
         """
-        pass
+        prompt = f"Policy question: {request}"
+        return _run_worker('policy_agent', 'PolicyAgent', policy_agent,
+                           session_id, '', prompt)
 
     # TODO: Implement route_to_refund_agent
     @tool
@@ -551,7 +896,13 @@ def build_orchestrator_agent(
         Returns:
             Refund decision from the RefundAgent
         """
-        pass
+        prompt = (f"Session ID: {session_id}\n"
+                  f"Customer ID: {customer_id}\n"
+                  f"Customer request: {request}\n\n"
+                  f"Read the inventory context for this session, apply the correct "
+                  f"return window for the customer's tier and make the refund decision.")
+        return _run_worker('refund_agent', 'RefundAgent', refund_agent,
+                           session_id, customer_id, prompt)
 
     # TODO: Implement route_to_communication_agent
     @tool
@@ -569,7 +920,13 @@ def build_orchestrator_agent(
         Returns:
             Final customer-facing response drafted by CommunicationAgent
         """
-        pass
+        prompt = (f"Session ID: {session_id}\n"
+                  f"Customer ID: {customer_id}\n"
+                  f"Customer's original message: {original_request}\n\n"
+                  f"Read the full workflow context for this session and write the "
+                  f"final customer-facing reply.")
+        return _run_worker('communication_agent', 'CommunicationAgent', communication_agent,
+                           session_id, customer_id, prompt)
 
     # TODO: Implement initialize_session
     @tool
@@ -585,10 +942,51 @@ def build_orchestrator_agent(
         Returns:
             Confirmation that the session was initialized
         """
-        pass
+        try:
+            state = _create_workflow_state(session_id, customer_id)
+            return (f"Session {session_id} initialized for customer {customer_id} "
+                    f"(WorkflowState version {state['version']}).")
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
+            # Same session, new turn (e.g. chat mode): clear the previous turn's
+            # agent results so stale findings are not reused for the new request.
+            state = _read_workflow_state(session_id) or {}
+            version = int(state.get('version', 0))
+            _update_workflow_state(
+                session_id,
+                {'inventory_agent': '', 'policy_agent': '',
+                 'refund_agent': '', 'communication_agent': ''},
+                version,
+            )
+            return (f"Session {session_id} already existed for customer {customer_id}; "
+                    f"previous results cleared for the new request.")
 
     # TODO: Instantiate and return the OrchestratorAgent
-    pass
+    # Strands runs a turn's tool calls CONCURRENTLY by default. Routing must be
+    # ordered (initialize_session -> inventory -> refund -> communication), so
+    # the orchestrator uses a sequential executor. The PolicyAgent still runs
+    # its three retrievers in parallel inside search_all_policies.
+    executor_kwargs = {}
+    try:
+        from strands.tools.executors import SequentialToolExecutor
+        executor_kwargs['tool_executor'] = SequentialToolExecutor()
+    except ImportError:
+        pass  # older Strands version: fall back to the default executor
+
+    return Agent(
+        name="OrchestratorAgent",
+        model=model,
+        system_prompt=system_prompt,
+        **executor_kwargs,
+        tools=[
+            initialize_session,
+            route_to_inventory_agent,
+            route_to_policy_agent,
+            route_to_refund_agent,
+            route_to_communication_agent,
+        ],
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -715,7 +1113,109 @@ def create_guardrail() -> tuple[str, str]:
     # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
     # and return (guardrail_id, guardrail_version).
 
-    pass
+    # Denied-topic definitions, one per entry in config.GUARDRAIL_BLOCKED_TOPICS
+    topic_definitions = {
+        "competitor products": {
+            'name': 'competitor_products',
+            'definition': ("Requests to discuss, recommend, compare against or promote products, "
+                           "stores or services from retailers other than NovaMart."),
+            'examples': [
+                "Is Amazon's version of these headphones better than yours?",
+                "Should I buy this laptop from Best Buy instead?",
+                "Which competitor has a cheaper smart watch?",
+            ],
+        },
+        "pricing negotiations": {
+            'name': 'pricing_negotiations',
+            'definition': ("Haggling over price or asking NovaMart to lower, match or change an "
+                           "advertised price, or to grant an unoffered discount. This does not "
+                           "include arithmetic using an already-specified price and discount."),
+            'examples': [
+                "Can you give me a better price on this laptop?",
+                "I will only buy it if you drop the price by 20 dollars.",
+                "Match the lower price I saw elsewhere or I cancel my order.",
+            ],
+        },
+        "legal threats": {
+            'name': 'legal_threats',
+            'definition': ("Threats of lawsuits, legal action, attorneys, court proceedings or "
+                           "regulatory complaints directed at NovaMart."),
+            'examples': [
+                "I am going to sue NovaMart if you do not refund me.",
+                "My lawyer will be contacting you about this order.",
+                "I will take you to court over this.",
+            ],
+        },
+    }
+    topics_config = [
+        {
+            'name':       topic_definitions[t]['name'],
+            'definition': topic_definitions[t]['definition'],
+            'examples':   topic_definitions[t]['examples'],
+            'type':       'DENY',
+        }
+        for t in config.GUARDRAIL_BLOCKED_TOPICS
+    ]
+
+    response = bedrock_client.create_guardrail(
+        name=config.GUARDRAIL_NAME,
+        description=("NovaMart customer support guardrail: blocks harmful content, protects PII, "
+                     "denies competitor, price-negotiation and legal-threat topics, filters profanity."),
+        contentPolicyConfig={
+            'filtersConfig': [
+                {'type': 'SEXUAL',     'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'VIOLENCE',   'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'HATE',       'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'INSULTS',    'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+                {'type': 'MISCONDUCT', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            ]
+        },
+        sensitiveInformationPolicyConfig={
+            'piiEntitiesConfig': [
+                {'type': 'CREDIT_DEBIT_CARD_NUMBER',  'action': 'BLOCK'},
+                {'type': 'US_SOCIAL_SECURITY_NUMBER', 'action': 'BLOCK'},
+                {'type': 'EMAIL',                     'action': 'ANONYMIZE'},
+                {'type': 'PHONE',                     'action': 'ANONYMIZE'},
+            ]
+        },
+        topicPolicyConfig={
+            'topicsConfig': topics_config,
+            'tierConfig':   {'tierName': 'STANDARD'},
+        },
+        crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+        wordPolicyConfig={
+            'managedWordListsConfig': [{'type': 'PROFANITY'}]
+        },
+        blockedInputMessaging=("Sorry, I can't help with that request. I'm happy to help with your "
+                               "NovaMart orders, returns, shipping or warranty questions."),
+        blockedOutputsMessaging=("Sorry, I can't provide that response. Please contact NovaMart "
+                                 "Customer Support if you need further help with your order."),
+    )
+    guardrail_id = response['guardrailId']
+    print(f"  Guardrail created: {guardrail_id} (DRAFT)")
+
+    # Publish a numbered, immutable version (never use DRAFT in production)
+    version_response = bedrock_client.create_guardrail_version(
+        guardrailIdentifier=guardrail_id,
+        description="Initial published version for NovaMart support agents",
+    )
+    guardrail_version = version_response['version']
+
+    # Wait until the published version is READY
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        status = bedrock_client.get_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion=guardrail_version,
+        ).get('status')
+        if status == 'READY':
+            break
+        if status == 'FAILED':
+            raise RuntimeError(f"Guardrail version {guardrail_version} failed to publish")
+        time.sleep(3)
+
+    print(f"  Guardrail version published: {guardrail_version}")
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
@@ -770,7 +1270,29 @@ def deploy_to_agentcore_runtime(
     # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
     # 4. Read the ARN the CLI recorded:
     #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+    runtime_env = {
+        'AWS_REGION':        config.AWS_REGION,
+        'PROJECT_NAME':      config.PROJECT_NAME,
+        'RETURNS_KB_ID':     config.RETURNS_KB_ID,
+        'SHIPPING_KB_ID':    config.SHIPPING_KB_ID,
+        'WARRANTY_KB_ID':    config.WARRANTY_KB_ID,
+        'AGENT_LOG_GROUP':   config.AGENT_LOG_GROUP,
+        'GUARDRAIL_ID':      guardrail_id,
+        'GUARDRAIL_VERSION': str(guardrail_version),
+    }
+    missing = [k for k, v in runtime_env.items() if not v]
+    if missing:
+        print(f"  [Warning] Empty runtime environment variables: {missing} "
+              f"(check .env - the KB IDs are required for task3)")
+
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN,
+    )
+    agentcore_cli.deploy()
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -813,7 +1335,20 @@ def configure_memory(runtime_arn: str) -> str:
     #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
     #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
     # Store the API response in `response`.
-    response = None
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description=("NovaMart customer support memory: session-scoped conversation "
+                     "summaries for multi-turn context, retained for 7 days."),
+        eventExpiryDuration=7,
+        memoryStrategies=[{
+            'summaryMemoryStrategy': {
+                'name': 'SessionSummary',
+                'description': 'Summarizes each customer support session',
+                'namespaces': ['/summaries/{actorId}/{sessionId}'],
+            }
+        }],
+        clientToken=str(uuid.uuid4()),
+    )
 
     if response is None:
         raise NotImplementedError("configure_memory: create_memory() not implemented")
@@ -861,8 +1396,21 @@ def configure_observability(runtime_arn: str) -> None:
     # Wrap the call in try/except - on success print the CloudWatch log group
     # and the X-Ray sampling rate; on exception print
     #   "[Note] Observability configuration failed: <e>"
-
-    pass
+    logging_configuration = {
+        'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
+                             'logLevel': 'INFO', 'enabled': True},
+        'xRayConfig':       {'enabled': True, 'samplingRate': 1.0},
+    }
+    try:
+        summary = apply_observability_config(runtime_arn, logging_configuration)
+        print(f"  CloudWatch Logs : {logging_configuration['cloudWatchConfig']['logGroupName']} "
+              f"(level {logging_configuration['cloudWatchConfig']['logLevel']})")
+        print(f"  X-Ray tracing   : enabled, sampling rate "
+              f"{logging_configuration['xRayConfig']['samplingRate'] * 100:.0f}%")
+        if summary:
+            print(f"  Summary         : {summary}")
+    except Exception as e:
+        print(f"  [Note] Observability configuration failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════
